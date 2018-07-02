@@ -1,0 +1,22 @@
+python train_model_32k.py \
+--log_dir=${LOG_DIR} \
+--batch_size=64 \
+--warmup_steps=0 \
+--max_number_of_steps=28800 \
+--log_every_n_steps=1 \
+--num_clones=4 \
+--summary_verbosity=1 \
+--save_summaries_steps=4 \
+--save_interval_secs=300 \
+--run_mode=train \
+--variable_update=distributed_replicated \
+--local_parameter_device=cpu \
+--clone_on_cpu=False \
+--data_format=NCHW \
+--dataset_dir=${DATASET_DIR} \
+--model_name=resnet_v1_50 \
+--sync_replicas=False \
+--ps_hosts=${PS_HOSTS} \
+--worker_hosts=${WORKER_HOSTS} \
+--job_name=${JOB_NAME} \
+--task_index=${TASK_INDEX}
