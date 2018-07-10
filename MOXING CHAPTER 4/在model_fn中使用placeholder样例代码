@@ -1,0 +1,58 @@
+import numpy as np
+import tensorflow as tf
+import moxing.tensorflow as mox
+from moxing.tensorflow.executor.hooks import FeedSessionRunHook
+slim = tf.contrib.slim
+
+
+def input_fn(run_mode, **kwargs):
+  return [tf.constant(0.0)]
+
+
+def model_fn(inputs, mode, **kwargs):
+  del inputs
+  images = tf.placeholder(dtype=tf.float32, shape=[16, 16, 16, 3])
+  labels = tf.placeholder(dtype=tf.int64, shape=[16])
+  net = slim.flatten(images)
+  logits = slim.fully_connected(net, 10)
+  labels_one_hot = slim.one_hot_encoding(labels, 10)
+  loss = tf.losses.softmax_cross_entropy(
+    logits=logits, onehot_labels=labels_one_hot,
+    label_smoothing=0.0, weights=1.0)
+
+  feed_images = np.random.random(size=[16, 16, 16, 3])
+  feed_labels = np.random.random_integers(low=0, high=10, size=[16])
+
+  feed_hook = FeedSessionRunHook(feed_dict={images: feed_images, labels: feed_labels})
+
+  return mox.ModelSpec(loss=loss, log_info={'loss': loss}, hooks=[feed_hook])
+
+
+mox.run(input_fn=input_fn,
+        model_fn=model_fn,
+        optimizer_fn=mox.get_optimizer_fn('sgd', learning_rate=0.001),
+        run_mode=mox.ModeKeys.TRAIN,
+        auto_batch=False,
+        batch_size=16,
+        log_dir=None,
+        max_number_of_steps=100,
+        log_every_n_steps=10)
+FeedSessionRunHook的源码非常简单，如下：
+class FeedSessionRunHook(mox.AggregativeSessionRunHook):
+  def __init__(self, feed_dict):
+    super(FeedSessionRunHook, self).__init__()
+    self.feed_dict = feed_dict
+
+  def before_run(self, run_context):
+    if self.feed_dict:
+      run_args = tf.train.SessionRunArgs(fetches=None, feed_dict=self.feed_dict)
+      return run_args
+
+  def support_aggregation(self):
+    return False
+
+  def support_sync_workers(self):
+    return False
+
+  def run_inter_mode(self):
+    return False
