@@ -1,0 +1,55 @@
+import tensorflow as tf
+import moxing.tensorflow as mox
+slim = tf.contrib.slim
+
+
+def input_fn(mode, **kwargs):
+  if mode == mox.ModeKeys.TRAIN:
+    meta = mox.ImageClassificationRawMetadata(base_dir='/export1/flowers/raw/split/train')
+  else:
+    meta = mox.ImageClassificationRawMetadata(base_dir='/export1/flowers/raw/split/eval')
+
+  dataset = mox.ImageClassificationRawDataset(meta)
+
+  image, label = dataset.get(['image', 'label'])
+  image = mox.get_data_augmentation_fn(
+    name='resnet_v1_50',
+    run_mode=mode,
+    output_height=224,
+    output_width=224)(image)
+  return image, label
+
+
+def model_fn(inputs, mode, **kwargs):
+  images, labels = inputs
+
+  logits, endpoints = mox.get_model_fn(
+    name='resnet_v1_50',
+    run_mode=mode,
+    num_classes=1000)(images)
+
+  labels_one_hot = slim.one_hot_encoding(labels, 1000)
+  loss = tf.losses.softmax_cross_entropy(logits=logits, onehot_labels=labels_one_hot)
+
+  accuracy = tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+
+  metric_hook = mox.LogEvaluationMetricHook(
+    monitor_info={'loss': loss, 'accuracy': accuracy},
+    batch_size=32,
+    samples_in_train=1000,
+    samples_in_eval=100,
+    evaluate_every_n_epochs=1,
+    prefix='[VALIDATION METRICS]')
+
+  return mox.ModelSpec(loss=loss,
+                       log_info={'loss': loss, 'accuracy': accuracy},
+                       hooks=[metric_hook])
+
+
+mox.run(input_fn=input_fn,
+        model_fn=model_fn,
+        optimizer_fn=mox.get_optimizer_fn('sgd', learning_rate=0.01),
+        batch_size=32,
+        run_mode=mox.ModeKeys.TRAIN,
+        inter_mode=mox.ModeKeys.EVAL,
+        max_number_of_steps=100)
