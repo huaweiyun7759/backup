@@ -1,0 +1,45 @@
+import tensorflow as tf
+import moxing.tensorflow as mox
+
+slim = tf.contrib.slim
+
+
+def input_fn(mode, **kwargs):
+  meta = mox.ImageClassificationRawMetadata(base_dir='/export1/flowers/raw/split/train')
+  dataset = mox.ImageClassificationRawDataset(meta)
+  image, label = dataset.get(['image', 'label'])
+  image = mox.get_data_augmentation_fn(
+    name='resnet_v1_50',
+    run_mode=mode,
+    output_height=224,
+    output_width=224)(image)
+  return image, label
+
+
+def model_fn(inputs, mode, **kwargs):
+  images, labels = inputs
+
+  logits, endpoints = mox.get_model_fn(
+    name='resnet_v1_50',
+    run_mode=mode,
+    num_classes=1000,
+    weight_decay=0.0001,
+    data_format='NCHW',
+    batch_norm_fused=True)(images)
+
+  labels_one_hot = slim.one_hot_encoding(labels, 1000)
+  loss = tf.losses.softmax_cross_entropy(logits=logits, onehot_labels=labels_one_hot)
+
+  export_spec = mox.ExportSpec(inputs_dict={'images': images}, outputs_dict={'logits': logits})
+
+  return mox.ModelSpec(loss=loss, export_spec=export_spec)
+
+
+mox.run(input_fn=input_fn,
+        model_fn=model_fn,
+        optimizer_fn=mox.get_optimizer_fn('sgd', learning_rate=0.01),
+        batch_size=32,
+        run_mode=mox.ModeKeys.TRAIN,
+        max_number_of_steps=100,
+        log_dir='/tmp/delete_me/log_0409',
+        export_model=mox.ExportKeys.TF_SERVING)
