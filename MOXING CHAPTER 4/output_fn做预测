@@ -1,0 +1,46 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+import moxing.tensorflow as mox
+
+slim = tf.contrib.slim
+
+
+def input_fn(mode, **kwargs):
+  meta = mox.ImageClassificationRawMetadata(base_dir='/export1/flowers/raw/split/eval')
+  dataset = mox.ImageClassificationRawDataset(meta)
+  image = dataset.get(['image'])[0]
+  image.set_shape([None, None, 3])
+  image = tf.expand_dims(image, 0)
+  image = tf.image.resize_images(image, size=[224, 224])
+  image = tf.squeeze(image, 0)
+  return image
+
+
+def model_fn(inputs, run_mode, **kwargs):
+  images = inputs[0]
+
+  logits, endpoints = mox.get_model_fn(
+    name='resnet_v1_50',
+    run_mode=run_mode,
+    num_classes=1000,
+    weight_decay=0.0001)(images)
+  prediction = tf.argmax(logits, axis=1)
+
+  return mox.ModelSpec(output_info={'prediction': prediction})
+
+
+def output_fn(outputs):
+  df = pd.DataFrame(np.array(outputs))
+  with mox.file.File('s3://dls-test/outputs.txt', 'w') as f:
+    df.to_csv(f)
+
+
+mox.run(input_fn=input_fn,
+        model_fn=model_fn,
+        output_fn=output_fn,
+        output_every_n_steps=10,
+        batch_size=32,
+        run_mode=mox.ModeKeys.PREDICT,
+        max_number_of_steps=10,
+        checkpoint_path='/tmp/checkpoint_path')
