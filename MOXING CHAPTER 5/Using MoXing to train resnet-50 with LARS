@@ -1,0 +1,175 @@
+import tensorflow as tf
+import moxing.tensorflow as mox
+
+slim = tf.contrib.slim
+
+tf.flags.DEFINE_string('data_format',
+                       default='NHWC', help='NHWC or NCHW')
+tf.flags.DEFINE_integer('num_classes',
+                        default=1000, help='number of classes')
+tf.flags.DEFINE_string('dataset_name',
+                       default=None, help='dataset name')
+tf.flags.DEFINE_string('data_url',
+                       default=None, help='dataset dir')
+tf.flags.DEFINE_string('model_name',
+                       default=None, help='model_name')
+tf.flags.DEFINE_string('run_mode',
+                       default='train', help='run_mode')
+tf.flags.DEFINE_string('log_dir',
+                       default=None, help='train_dir or eval_dir')
+tf.flags.DEFINE_string('checkpoint_path',
+                       default=None, help='ckpt path')
+tf.flags.DEFINE_integer('batch_size',
+                        default=None, help='batch size')
+tf.flags.DEFINE_integer('max_number_of_steps',
+                        default=None, help='max_number_of_steps')
+tf.flags.DEFINE_integer('log_every_n_steps',
+                        default=None, help='log_every_n_steps')
+tf.flags.DEFINE_integer('save_summaries_steps',
+                        default=None, help='save_summary_steps')
+tf.flags.DEFINE_integer('save_interval_secs',
+                        default=None, help='save_model_secs')
+
+flags = tf.flags.FLAGS
+
+is_training = (flags.run_mode == mox.ModeKeys.TRAIN)
+data_format = flags.data_format
+num_classes = flags.num_classes
+
+dataset_meta = mox.get_dataset_meta(flags.dataset_name)
+model_meta = mox.get_model_meta(flags.model_name)
+split_name_train, split_name_eval = dataset_meta.splits_to_sizes.keys()
+split_name = split_name_train if is_training else split_name_eval
+
+
+def input_fn(run_mode, **kwargs):
+  dataset = mox.get_dataset(name=flags.dataset_name, split_name=split_name,
+                            dataset_dir=flags.data_url, capacity=flags.batch_size * 20)
+  image, label = dataset.get(['image', 'label'])
+  data_augmentation_fn = mox.get_data_augmentation_fn(
+    name=flags.model_name, run_mode=run_mode,
+    output_height=224, output_width=224)
+  image = data_augmentation_fn(image)
+  label -= 1
+  return image, label
+
+
+def model_fn(inputs, run_mode, **kwargs):
+  images, labels = inputs
+  mdoel_fn = mox.get_model_fn(
+    name=flags.model_name,
+    run_mode=run_mode,
+    num_classes=num_classes,
+    weight_decay=0.0001,
+    data_format=data_format,
+    batch_norm_fused=True,
+    batch_renorm=False)
+  logits, _ = mdoel_fn(images)
+  labels_one_hot = slim.one_hot_encoding(labels, num_classes)
+  loss = tf.losses.softmax_cross_entropy(
+    logits=logits, onehot_labels=labels_one_hot,
+    label_smoothing=0.0, weights=1.0)
+
+  accuracy_top_1 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+  accuracy_top_5 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32))
+  # 32K weight decay should be inside LARS optimizer, but we still summary it.
+  regularization_losses = mox.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+  regularization_loss = tf.add_n(regularization_losses)
+  log_info = {'ent_loss': loss,
+              'reg_loss': regularization_loss,
+              'top1': accuracy_top_1,
+              'top5': accuracy_top_5}
+  return mox.ModelSpec(loss=loss, log_info=log_info)
+
+
+def config_lr(global_step, warm_up_steps, init_learning_rate,
+              end_learning_rate, total_steps):
+  def warm_up_lr(global_step, warm_up_steps, init_learning_rate,
+                 end_learning_rate, name=None):
+    with tf.name_scope(name, "warm_up_lr",
+                       [init_learning_rate, global_step,
+                        end_learning_rate]):
+      init_learning_rate = tf.convert_to_tensor(init_learning_rate,
+                                                name="init_learning_rate")
+      end_learning_rate = tf.convert_to_tensor(end_learning_rate,
+                                               name="end_learning_rate")
+      dtype = init_learning_rate.dtype
+      global_step = tf.cast(global_step, dtype)
+      warm_up_steps = tf.cast(warm_up_steps, dtype)
+      diff = end_learning_rate - init_learning_rate
+      p = global_step / warm_up_steps
+      return init_learning_rate + diff * p
+
+  def lr_warm_up_fn():
+    return warm_up_lr(global_step, warm_up_steps, init_learning_rate,
+                      end_learning_rate)
+
+  def lr_decay_fn():
+    return tf.train.polynomial_decay(learning_rate=end_learning_rate,
+                                     global_step=global_step,
+                                     decay_steps=total_steps,
+                                     end_learning_rate=0.0001, power=2)
+
+  return tf.cond(tf.less(global_step, warm_up_steps), lr_warm_up_fn,
+                 lr_decay_fn)
+
+
+def optimizer_fn():
+  num_samples = 1281167  # ImageNet
+  total_batch_size = 32768
+  num_workers = len(mox.get_flag('worker_hosts').split(',')) if is_training else 1
+  global_step = tf.train.get_or_create_global_step()
+  num_batches = int(total_batch_size / num_workers / flags.batch_size / mox.get_flag('num_gpus'))
+  tf.logging.info('Batch Gradients Prior = %d' % num_batches)
+
+  # https://people.eecs/berkeley.edu/~youyang/publications/batch/32k_logs/resnet50_32k_2.log
+  warm_up_steps = 200  # epoch = 5
+  total_steps = 3600  # epoch = 92
+
+  init_learning_rate = 2.0
+  end_learning_rate = 29.0
+  # Notice that global_step inside config_lr is the times that BDP is taken and apply to the
+  # global variables. But the global step inside mox.run (sync_replicas=Flase) is increased
+  # each step including apply to the BDP accumlator.
+  if mox.get_flag('sync_replicas'):
+    lr_global_step = tf.floor(global_step / (num_batches))
+  else:
+    lr_global_step = tf.floor(global_step / (num_batches * num_workers))
+  lr = config_lr(global_step=lr_global_step, warm_up_steps=warm_up_steps,
+                 init_learning_rate=init_learning_rate,
+                 end_learning_rate=end_learning_rate,
+                 total_steps=total_steps)
+
+  base_opt = mox.get_optimizer_fn('momentum', learning_rate=lr, momentum=0.9)()
+  lars_opt = mox.get_optimizer_wrapper_fn('lars', base_opt, ratio=0.001, weight_decay=0.0001)()
+  bdp_lars_opt = mox.get_optimizer_wrapper_fn('batch_gradients', lars_opt,
+                                              num_batches=num_batches, sync_on_apply=True)()
+
+  return bdp_lars_opt
+
+
+if __name__ == '__main__':
+  if flags.run_mode == 'train':
+    mox.run(input_fn=input_fn,
+            model_fn=model_fn,
+            optimizer_fn=optimizer_fn,
+            batch_size=flags.batch_size,
+            run_mode=mox.ModeKeys.TRAIN,
+            log_dir=flags.log_dir,
+            max_number_of_steps=flags.max_number_of_steps,
+            log_every_n_steps=flags.log_every_n_steps,
+            save_summary_steps=flags.save_summaries_steps,
+            save_model_secs=flags.save_interval_secs)
+
+  elif flags.run_mode == 'evaluation':
+    imagenet_eval_samples = 50000
+    total_batch_size = flags.batch_size * mox.get_flag('num_gpus')
+    max_number_of_steps = int(imagenet_eval_samples / total_batch_size)
+    mox.run(input_fn=input_fn,
+            model_fn=model_fn,
+            optimizer_fn=optimizer_fn,
+            batch_size=125,
+            run_mode=mox.ModeKeys.EVAL,
+            log_dir=flags.log_dir,
+            max_number_of_steps=max_number_of_steps,
+            checkpoint_path=flags.checkpoint_path)
