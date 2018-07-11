@@ -1,0 +1,200 @@
+import tensorflow as tf
+import moxing.tensorflow as mox
+import math
+
+slim = tf.contrib.slim
+
+tf.flags.DEFINE_string('data_format', 
+             default='NHWC', help='NHWC or NCHW')
+tf.flags.DEFINE_string('data_url', 
+             default=None, help='dataset dir')
+tf.flags.DEFINE_string('model_name', 
+             default=None, help='model_name')
+tf.flags.DEFINE_string('run_mode', 
+             default='TRAIN', help='run_mode')
+tf.flags.DEFINE_string('train_url', 
+             default=None, help='train_dir')
+tf.flags.DEFINE_string('eval_url', 
+             default=None, help='eval_dir')
+tf.flags.DEFINE_string('checkpoint_url', 
+             default=None, help='ckpt path')
+tf.flags.DEFINE_integer('batch_size', 
+             default=None, help='batch size')
+tf.flags.DEFINE_integer('max_epochs',
+             default=None, help='Max number of epoches to train')
+tf.flags.DEFINE_integer('log_every_n_steps', 
+             default=10, help='log_every_n_steps')
+tf.flags.DEFINE_integer('save_summaries_steps', 
+             default=10, help='save_summary_steps')
+tf.flags.DEFINE_integer('save_interval_secs', 
+             default=60, help='save_model_secs')
+tf.flags.DEFINE_string('dataset_name', 
+             default='imagenet', help='Name of dataset.')
+tf.flags.DEFINE_float('weight_decay', 
+             default=0.0001, help='Weight decay')
+tf.flags.DEFINE_float('momentum',  default=0,
+             help='Set 0 to use `SGD` opt, >0 to use momentum opt')
+tf.flags.DEFINE_string('learning_rate_strategy',
+             default='30:0.1,60:0.01,80:0.001,90:0.0001', help='')
+tf.flags.DEFINE_string('lr_warmup_strategy', default='linear', help='linear or exponential')
+
+flags = tf.flags.FLAGS
+
+def main():
+  data_format = flags.data_format
+  num_workers = len(mox.get_flag('worker_hosts').split(','))
+
+  # Get some metadata
+  is_training = (flags.run_mode == mox.ModeKeys.TRAIN)
+  dataset_meta = mox.get_dataset_meta(flags.dataset_name)
+  model_meta = mox.get_model_meta(flags.model_name)
+  split_name_train, split_name_eval = dataset_meta.splits_to_sizes.keys()
+  split_name = split_name_train if is_training else split_name_eval
+  total_samples_train, total_samples_eval = dataset_meta.splits_to_sizes.values()
+  total_samples = total_samples_train if is_training else total_samples_eval
+  image_size = model_meta.default_image_size
+  labels_offset = model_meta.default_labels_offset
+  num_classes = dataset_meta.num_classes - labels_offset
+
+  log_dir = flags.train_url if is_training else flags.eval_url
+  save_summary_steps = flags.save_summaries_steps if is_training else None
+  save_model_secs = flags.save_interval_secs if is_training else None
+
+  if (is_training):
+    total_batch_size = flags.batch_size * mox.get_flag('num_gpus') * num_workers
+    if mox.get_flag('sync_replicas'):
+      max_number_of_steps = int(math.ceil(flags.max_epochs * total_samples / total_batch_size))
+    else:
+      max_number_of_steps = int(
+        math.ceil(flags.max_epochs * total_samples * num_workers / total_batch_size))
+  else:
+    assert num_workers == 1
+    total_batch_size = flags.batch_size * mox.get_flag('num_gpus')
+    max_number_of_steps = int(math.ceil(total_samples / total_batch_size))
+
+  def input_fn(run_mode, **kwargs):
+    dataset = mox.get_dataset(name=flags.dataset_name, split_name=split_name,
+                              dataset_dir=flags.data_url, capacity=flags.batch_size * 20)
+    image, label = dataset.get(['image', 'label'])
+    data_augmentation_fn = mox.get_data_augmentation_fn(
+      name=flags.model_name, run_mode=run_mode,
+      output_height=image_size, output_width=image_size)
+    image = data_augmentation_fn(image)
+    label -= labels_offset
+    return image, label
+
+  def model_fn(inputs, run_mode, **kwargs):
+    images, labels = inputs
+    mox_mdoel_fn = mox.get_model_fn(
+      name=flags.model_name,
+      run_mode=run_mode,
+      num_classes=num_classes,
+      weight_decay=flags.weight_decay,
+      data_format=data_format,
+      batch_norm_fused=True,
+      batch_renorm=False,
+      image_height=image_size,
+      image_width=image_size)
+    logits, end_points = mox_mdoel_fn(images)
+    labels_one_hot = slim.one_hot_encoding(labels, num_classes)
+    loss = tf.losses.softmax_cross_entropy(
+      logits=logits, onehot_labels=labels_one_hot,
+      label_smoothing=0.0, weights=1.0)
+    if 'AuxLogits' in end_points:
+      aux_loss = tf.losses.softmax_cross_entropy(
+        logits=end_points['AuxLogits'], onehot_labels=labels_one_hot,
+        label_smoothing=0.0, weights=0.4, scope='aux_loss')
+      loss += aux_loss
+    accuracy_top_1 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 1), tf.float32))
+    accuracy_top_5 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(logits, labels, 5), tf.float32))
+    regularization_losses = mox.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+    regularization_loss = tf.add_n(regularization_losses)
+    total_loss = loss + regularization_loss
+    log_info = {'ent_loss': loss,
+                'reg_loss': regularization_loss,
+                'total_loss': total_loss,
+                'top1': accuracy_top_1,
+                'top5': accuracy_top_5}
+    top_5_confidence, top_5_label = tf.nn.top_k(tf.nn.softmax(logits), k=5)
+    top_5_label += labels_offset
+    export_spec = mox.ExportSpec(inputs_dict={'images': images},
+                                 outputs_dict={'logits': logits,
+                                               'labels': top_5_label,
+                                               'confidences': top_5_confidence})
+    return mox.ModelSpec(loss=total_loss, log_info=log_info, export_spec=export_spec)
+
+  def optimizer_fn():
+    lr = config_lr()
+    if flags.momentum > 0:
+      opt = mox.get_optimizer_fn('momentum', learning_rate=lr, momentum=flags.momentum)()
+    else:
+      opt = mox.get_optimizer_fn('sgd', learning_rate=lr)()
+    return opt
+
+  def config_lr():
+    num_workers = len(mox.get_flag('worker_hosts').split(','))
+    num_gpus = mox.get_flag('num_gpus')
+    steps_per_epoch = int(math.ceil(total_samples / (flags.batch_size * num_gpus * num_workers)))
+    global_step = tf.train.get_or_create_global_step()
+    if mox.get_flag('sync_replicas'):
+      lr_global_step = global_step
+    else:
+      lr_global_step = tf.cast(tf.floor(global_step / num_workers), tf.int64)
+    stage_lrs = flags.learning_rate_strategy.split(',')
+    if len(stage_lrs) == 1:
+      return float(stage_lrs[0].strip().split(':')[1])
+    lr_boundaries = []
+    lr_values = []
+    warmup_begin, warmup_end, warmup_steps = None, None, None
+    for i in range(len(stage_lrs)):
+      lr_epoch, lr_value = stage_lrs[i].strip().split(':')
+      if '->' in lr_value:
+        if i != 0:
+          raise ValueError('Warmup learning rate is only supported in the first stage.')
+        warmup_begin, warmup_end = lr_value.split('->')
+        warmup_begin = float(warmup_begin)
+        warmup_end = float(warmup_end)
+        warmup_steps = int(lr_epoch) * steps_per_epoch
+      else:
+        lr_boundaries.append(int(lr_epoch) * steps_per_epoch)
+        lr_values.append(float(lr_value))
+
+    def piecewise_lr():
+      return tf.train.piecewise_constant(
+                lr_global_step,
+                boundaries=lr_boundaries[:-1],
+                values=lr_values)
+
+    if warmup_steps is None:
+      lr = piecewise_lr()
+    else:
+      if flags.lr_warmup_strategy == 'linear':
+        diff = warmup_end - warmup_begin
+        p = lr_global_step / warmup_steps
+        warmup_lr = tf.cast(warmup_begin + diff * p, tf.float32)
+      elif flags.lr_warmup_strategy == 'exponential':
+        diff = warmup_end / warmup_begin
+        warmup_lr = tf.train.exponential_decay(warmup_begin, lr_global_step, warmup_steps, diff)
+      else:
+        raise ValueError('lr_warmup_strategy should be given when use warmup learning rate')
+      lr = tf.cond(tf.greater(lr_global_step, warmup_steps),
+                   true_fn=piecewise_lr,
+                   false_fn=lambda: warmup_lr)
+    return lr
+
+  mox.run(input_fn=input_fn,
+          model_fn=model_fn,
+          optimizer_fn=optimizer_fn,
+          run_mode=flags.run_mode,
+          batch_size=flags.batch_size,
+          log_dir=log_dir,
+          max_number_of_steps=max_number_of_steps,
+          log_every_n_steps=flags.log_every_n_steps,
+          save_summary_steps=save_summary_steps,
+          save_model_secs=save_model_secs,
+          checkpoint_path=flags.checkpoint_url,
+          export_model=mox.ExportKeys.TF_SERVING)
+
+
+if __name__ == '__main__':
+  main()
